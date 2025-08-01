@@ -1,2 +1,5 @@
 requests
 python-dotenv
+beautifulsoup4 #Manipular URL
+lxml #"Parser" de HTML
+playwright
