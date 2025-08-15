@@ -1,6 +1,7 @@
 import os
 import requests
 import json
+import sqlite3
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from bs4 import BeautifulSoup
@@ -14,85 +15,131 @@ load_dotenv()
 # e a URL do webhook obtida do .env.
 GUPY_URL = "https://portal.gupy.io/job-search/term=python"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+DB_FILE = "jobs.db"
 
 
-def scrape_gupy(url):
-    # Função principal, responsável por entrar no site da Gupy e extrair os dados.
-    # Usa o Playwright porque a página carrega vagas dinamicamente com JavaScript.
-    # Um request simples não capturaria o conteúdo renderizado.
-    # O Playwright abre um navegador em modo headless para carregar a página por completo.
-    print("Iniciando o scraper da Gupy...")
+def setup_database():
+    """Cria o banco de dados e a tabela de vagas, se não existirem."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # A tabela 'jobs' terá uma coluna 'link' que é a chave primária.
+    # Isso garante que cada link seja único no banco de dados.
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS jobs (
+            link TEXT PRIMARY KEY
+        )
+    ''')
+    conn.commit()
+    conn.close()
+    print("Banco de dados configurado com sucesso.")
+
+
+def is_job_in_db(link):
+    """Verifica se um link de vaga já existe no banco de dados."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # O '?' é um placeholder para evitar injeção de SQL
+    cursor.execute("SELECT 1 FROM jobs WHERE link = ?", (link,))
+    exists = cursor.fetchone() is not None
+    conn.close()
+    return exists
+
+
+def add_job_to_db(link):
+    """Adiciona um novo link de vaga ao banco de dados."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    # Usamos 'INSERT OR IGNORE' para que, se o link já existir, o comando
+    # seja simplesmente ignorado sem causar um erro.
+    cursor.execute("INSERT OR IGNORE INTO jobs (link) VALUES (?)", (link,))
+    conn.commit()
+    conn.close()
+
+
+def scrape_gupy(url, max_pages=5):
+    """
+    Raspa o site da Gupy, navegando entre as páginas, extrai os detalhes 
+    das vagas e retorna uma lista de dicionários.
+    
+    :param url: A URL inicial da busca.
+    :param max_pages: O número máximo de páginas para raspar.
+    """
+    print("Iniciando o scraper da Gupy com suporte a paginação...")
+    vagas_encontradas = []
+    
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
-            
-            # Navega para a URL com um timeout de 60 segundos para permitir o carregamento.
             page.goto(url, timeout=60000)
+
+            page_count = 1
+            while page_count <= max_pages:
+                print(f"\n--- Raspando a página {page_count} ---")
+                
+                # Espera o container principal das vagas carregar
+                page.wait_for_selector('main#main-content ul', timeout=30000)
+                time.sleep(3) # Pausa extra para garantir renderização completa
+                
+                html = page.content()
+                soup = BeautifulSoup(html, "lxml")
+                job_list_container = soup.find('main', id='main-content').find('ul')
+                
+                if not job_list_container:
+                    print("Container de vagas não encontrado na página. Saindo...")
+                    break
+                    
+                lista_de_vagas_html = job_list_container.find_all("li")
+                print(f"Processando {len(lista_de_vagas_html)} vagas encontradas na página atual...")
+                
+                for vaga_html in lista_de_vagas_html:
+                    # ... (O código de extração de cada vaga continua o mesmo)
+                    titulo_tag = vaga_html.find("h3")
+                    link_tag = vaga_html.find("a")
+
+                    if titulo_tag and link_tag and link_tag.has_attr('href'):
+                        link = link_tag["href"]
+                        if not link.startswith("http"):
+                            link = "https://portal.gupy.io" + link
+
+                        location_tag = vaga_html.select_one('span[data-testid="job-location"]')
+                        work_model_tag = vaga_html.select_one('div[aria-label^="Modelo de trabalho"] span')
+                        
+                        vaga_data = {
+                            "title": titulo_tag.get_text(strip=True),
+                            "link": link,
+                            "location": location_tag.get_text(strip=True) if location_tag else "Não informado",
+                            "work_model": work_model_tag.get_text(strip=True) if work_model_tag else "Não informado",
+                        }
+                        vagas_encontradas.append(vaga_data)
+
+                # --- LÓGICA DE PAGINAÇÃO ---
+                # Procura o botão "Próxima página"
+                next_button_selector = 'button[aria-label="Next page"]'
+                next_button = page.query_selector(next_button_selector)
+
+                print(f"DEBUG: Botão 'Próxima' encontrado? {bool(next_button)}")
+
+                # Verifica se o botão existe e se NÃO está desativado
+                if next_button and not next_button.is_disabled():
+                    print("Encontrado botão 'Próxima página'. Clicando...")
+                    next_button.click()
+                    page_count += 1
+                    page.wait_for_load_state('networkidle', timeout=30000)
+                    # page.wait_for_load_state('domcontentloaded')
+                    time.sleep(2)
+                else:
+                    print("Não há mais páginas ou o botão 'Próxima página' está desativado. Finalizando a raspagem.")
+                    break # Sai do loop while
             
-            # Espera pelo seletor do menu de paginação.
-            # Isso garante que a lista de vagas foi carregada dinamicamente.
-            page.wait_for_selector('nav[aria-label="pagination navigation"]', timeout=30000)
-            
-            # Pausa para garantir a renderização completa de todos os elementos.
-            time.sleep(3)
-            
-            # Pega o conteúdo HTML final da página.
-            html = page.content()
             browser.close()
-    except PlaywrightTimeoutError:
-        # Captura o erro se o seletor de paginação não aparecer no tempo definido.
-        # Evita que o script quebre por lentidão do site ou por mudanças no layout.
-        print("Timeout ao esperar pelo seletor de paginação. O site pode estar lento ou o layout mudou.")
-        return []
-    except Exception as e:
-        # Captura genérica para outros erros inesperados do Playwright.
-        print(f"Ocorreu um erro inesperado no Playwright: {e}")
-        return []
-
-    # O HTML obtido é passado para o BeautifulSoup para facilitar a busca e extração de dados.
-    soup = BeautifulSoup(html, "lxml")
-    
-    # Navega na estrutura do HTML para encontrar o container principal (main) e a lista (ul) das vagas.
-    job_list_container = soup.find('main', id='main-content').find('ul')
-    
-    if not job_list_container:
-        return []
-
-    # Pega cada item da lista (cada <li> representa uma vaga).
-    lista_de_vagas_html = job_list_container.find_all("li")
-    vagas_encontradas = []
-
-    print(f"Processando {len(lista_de_vagas_html)} vagas encontradas...")
-    # Inicia um loop para processar o HTML de cada vaga encontrada.
-    for vaga_html in lista_de_vagas_html:
-        # Para cada vaga, busca a tag do título (h3) e a do link (a).
-        titulo_tag = vaga_html.find("h3")
-        link_tag = vaga_html.find("a")
-
-        # Prossegue apenas se o título e o link existirem, para evitar erros.
-        if titulo_tag and link_tag and link_tag.has_attr('href'):
-            link = link_tag["href"]
-            # Garante que todos os links sejam absolutos, pois alguns podem ser relativos (ex: /vaga/123).
-            if not link.startswith("http"):
-                link = "https://portal.gupy.io" + link
-
-            # Usa seletores de CSS mais específicos para capturar a localização e o modelo de trabalho.
-            location_tag = vaga_html.select_one('span[data-testid="job-location"]')
-            work_model_tag = vaga_html.select_one('div[aria-label^="Modelo de trabalho"] span')
             
-            # Monta um dicionário com os dados.
-            # Se uma tag não for encontrada, atribui 'Não informado' para manter a consistência.
-            vaga_data = {
-                "title": titulo_tag.get_text(strip=True),
-                "link": link,
-                "location": location_tag.get_text(strip=True) if location_tag else "Não informado",
-                "work_model": work_model_tag.get_text(strip=True) if work_model_tag else "Não informado",
-            }
-            vagas_encontradas.append(vaga_data)
+    except Exception as e:
+        print(f"Ocorreu um erro inesperado no Playwright: {e}")
+        return vagas_encontradas # Retorna o que conseguiu coletar até o erro
 
-    # Retorna a lista final com os dados de todas as vagas encontradas.
     return vagas_encontradas
+
 
 def format_discord_message(job):
     # Formata a mensagem para o Discord.
@@ -107,11 +154,12 @@ def format_discord_message(job):
     )
     return message
 
+
 def send_to_discord(webhook_url, message):
     # Pega a URL do webhook e a mensagem formatada para enviar ao Discord.
     if not webhook_url:
         print("ERRO: URL do Webhook do Discord não configurada.")
-        return
+        return False
 
     # O Discord espera um request POST com um corpo em JSON.
     # O conteúdo da mensagem deve estar na chave "content".
@@ -124,32 +172,47 @@ def send_to_discord(webhook_url, message):
     # Verifica se o status da resposta é 204, que indica sucesso para o Discord.
     if response.status_code == 204:
         print("Mensagem enviada com sucesso para o Discord!")
+        return True
     else:
         # Se ocorrer uma falha, exibe o código de status para depuração.
-        print(f"Falha ao enviar para o Discord. Status: {response.status_code}")
+        print(
+            f"Falha ao enviar para o Discord. Status: {response.status_code}")
+        return False
 
 
 # Ponto de entrada do script.
 # O código neste bloco só é executado quando o arquivo é chamado diretamente.
 if __name__ == "__main__":
     print("Iniciando processo de busca e notificação de vagas...")
-    
+
+    setup_database()
+
     # 1. Chama a função de scraping para buscar as vagas.
     lista_de_vagas = scrape_gupy(GUPY_URL)
 
+    vagas_novas = []
+    for vaga in lista_de_vagas:
+        if not is_job_in_db(vaga["link"]):
+            vagas_novas.append(vaga)
+
     # 2. Se nenhuma vaga for encontrada, exibe uma mensagem e encerra.
-    if not lista_de_vagas:
+    if not vagas_novas:
         print("Nenhuma vaga nova encontrada. Encerrando.")
     else:
         # 3. Se encontrou vagas, inicia o processo de envio.
-        print(f"\nEnviando {len(lista_de_vagas)} vagas para o Discord...\n")
+        print(f"\nEnviando {len(vagas_novas)} vagas para o Discord...\n")
         # Para cada vaga na lista...
-        for vaga in lista_de_vagas:
+        for vaga in vagas_novas:
             # ...formata a mensagem...
             mensagem_formatada = format_discord_message(vaga)
             # ...e envia para o Discord.
-            send_to_discord(DISCORD_WEBHOOK_URL, mensagem_formatada)
+            sucesso_envio = send_to_discord(DISCORD_WEBHOOK_URL, mensagem_formatada)
             # Delay de 1 segundo para evitar sobrecarregar a API do Discord.
+            
+            if sucesso_envio:
+                add_job_to_db(vaga["link"])
+                print(f"Vaga '{vaga['title']}' registrada no banco de dados.")
+
             time.sleep(3)
 
     print("\nProcesso finalizado.")
